@@ -4,10 +4,10 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { earFromLandmarks, yawProxy, ema } from "../lib/geometry";
 
 /**
- * LivenessChecker.jsx (UMD build loader + DEBUG + fresh onChange)
- * - Loads MediaPipe FaceMesh & Camera Utils UMD bundles via <script> tags.
- * - Uses window.FaceMesh and window.Camera to avoid constructor import issues.
- * - Emits fresh state to parent via useEffect whenever values change.
+ * LivenessChecker.jsx (UMD build loader + DEBUG + race-proof pass)
+ * - Loads MediaPipe FaceMesh & Camera Utils via UMD <script> tags.
+ * - Uses window.FaceMesh and window.Camera (avoids constructor import issues).
+ * - Blink hysteresis + refractory, frame-local pass check, final guard.
  */
 
 const DEBUG = true;
@@ -42,7 +42,7 @@ function loadScriptOnce(src, timeoutMs = 15000) {
 
 export default function LivenessChecker({
   sessionWindowMs = 8000,
-  earThreshold = 0.18,
+  earThreshold = 0.18,      // close threshold
   earCloseMinMs = 120,
   yawAbsThreshold = 0.55,
   yawHoldMinMs = 250,
@@ -60,7 +60,7 @@ export default function LivenessChecker({
   const [isRunning, setIsRunning] = useState(false);
   const [permissionError, setPermissionError] = useState(null);
   const [blinkCount, setBlinkCount] = useState(0);
-  const [turnDetected, setTurnDetected] = useState(null);
+  const [turnDetected, setTurnDetected] = useState(null); // "left" | "right" | null
   const [livenessPassed, setLivenessPassed] = useState(false);
 
   // debug metrics
@@ -68,12 +68,16 @@ export default function LivenessChecker({
   const [rightEAR, setRightEAR] = useState(0);
   const [yawDev, setYawDev] = useState(0);
 
+  const [turnedLeft, setTurnedLeft] = useState(false);
+  const [turnedRight, setTurnedRight] = useState(false);
+
   // internals
   const startedAtRef = useRef(null);
   const earLeftEMARef = useRef(null);
   const earRightEMARef = useRef(null);
   const eyesClosedSinceRef = useRef(null);
   const eyesWereClosedRef = useRef(false);
+  const lastBlinkAtRef = useRef(0);
 
   const yawEMARef = useRef(null);
   const yawBeyondSinceRef = useRef(null);
@@ -81,10 +85,16 @@ export default function LivenessChecker({
   const frameCountRef = useRef(0);
   const lastFacePresentRef = useRef(false);
 
+  const blinkCountRef = useRef(0);
+
+
   const resetSession = useCallback(() => {
     log("Reset session");
     setBlinkCount(0);
+    blinkCountRef.current = 0;
     setTurnDetected(null);
+    setTurnedLeft(false);
+    setTurnedRight(false);
     setLivenessPassed(false);
     setPermissionError(null);
 
@@ -96,6 +106,7 @@ export default function LivenessChecker({
     earRightEMARef.current = null;
     eyesClosedSinceRef.current = null;
     eyesWereClosedRef.current = false;
+    lastBlinkAtRef.current = 0;
 
     yawEMARef.current = null;
     yawBeyondSinceRef.current = null;
@@ -190,6 +201,8 @@ export default function LivenessChecker({
         livenessPassed,
         blinkCount,
         turnDetected,
+        turnedLeft,
+        turnedRight,
         leftEAR,
         rightEAR,
         yawDev,
@@ -198,12 +211,19 @@ export default function LivenessChecker({
     }
   }, [livenessPassed, blinkCount, turnDetected, leftEAR, rightEAR, yawDev, onChange]);
 
+  // ✅ Final guard: if both conditions satisfied at any point, flip to true
   useEffect(() => {
-    if (!livenessPassed && blinkCount >= 2 && !!turnDetected) {
-      console.log("[Liveness] Final guard: conditions met → set livenessPassed = true");
+    if (!livenessPassed && turnedLeft && turnedRight && blinkCount >= 2) {
+      console.log("[Liveness] Final guard → pass (both turns + 2 blinks)");
       setLivenessPassed(true);
     }
-  }, [blinkCount, turnDetected, livenessPassed]);
+  }, [turnedLeft, turnedRight, blinkCount, livenessPassed]);
+
+
+  useEffect(() => {
+    blinkCountRef.current = blinkCount;
+  }, [blinkCount]);
+
 
   const onResults = useCallback((results) => {
     frameCountRef.current += 1;
@@ -231,11 +251,10 @@ export default function LivenessChecker({
         eyesClosedSinceRef.current = null;
         yawBeyondSinceRef.current = null;
         updateDebug(0, 0, 0);
-        checkWindow();
         return;
       }
 
-      // Blink via EAR
+      // ---------- EAR (blink) with EMA + hysteresis + refractory ----------
       const left = earFromLandmarks(lm, 159, 145, 33, 133);
       const right = earFromLandmarks(lm, 386, 374, 263, 362);
       earLeftEMARef.current = ema(earLeftEMARef.current, left, 0.35);
@@ -245,8 +264,18 @@ export default function LivenessChecker({
       const rSm = earRightEMARef.current ?? right;
       const earAvg = (lSm + rSm) / 2;
 
-      const eyesClosed = earAvg < earThreshold;
+      // hysteresis: need to rise above openTh to leave "closed"
+      const closeTh = earThreshold;        // enter closed below this
+      const openTh = earThreshold + 0.03; // leave closed above this
       const now = performance.now();
+
+      const eyesClosed = eyesWereClosedRef.current
+        ? (earAvg < openTh)   // once closed, stay closed until we go above openTh
+        : (earAvg < closeTh); // to enter closed, must go below closeTh
+
+      // We'll compute "next" values locally to avoid races
+      let nextBlinkCount = blinkCount;
+      let nextTurnDetected = turnDetected;
 
       if (eyesClosed) {
         if (!eyesWereClosedRef.current) {
@@ -254,53 +283,86 @@ export default function LivenessChecker({
           eyesClosedSinceRef.current = now;
         }
       } else if (eyesWereClosedRef.current) {
+        // just transitioned closed -> open
         const closedMs = now - (eyesClosedSinceRef.current ?? now);
         eyesWereClosedRef.current = false;
         eyesClosedSinceRef.current = null;
+
         if (closedMs >= earCloseMinMs) {
-          setBlinkCount((c) => {
-            const n = c + 1;
-            log(`Blink detected (closed ~${Math.round(closedMs)}ms). Total: ${n}`);
-            return n;
-          });
+          const refractoryMs = 250;
+          if (now - lastBlinkAtRef.current >= refractoryMs) {
+            const newCount = blinkCountRef.current + 1; // ← read the live value
+            setBlinkCount(newCount);
+            blinkCountRef.current = newCount;          // ← keep ref hot
+            nextBlinkCount = newCount;                 // ← so frame-local pass check uses 2+
+            lastBlinkAtRef.current = now;
+            log(`Blink detected (closed ~${Math.round(closedMs)}ms). Total: ${newCount}`);
+          } else {
+            log("Blink ignored (refractory)", Math.round(now - lastBlinkAtRef.current), "ms");
+          }
         }
       }
 
-      // Head turn via yaw
-      const yawRaw = yawProxy(lm);
+      // ---------- Yaw (turn) with EMA + hold ----------
+      const yawRaw = yawProxy(lm);              // cheek-normalized nose offset recommended
       yawEMARef.current = ema(yawEMARef.current, yawRaw, 0.25);
       const yawSm = yawEMARef.current ?? yawRaw;
 
       const beyond = Math.abs(yawSm) >= yawAbsThreshold;
+      if (frameCountRef.current % 10 === 0) {
+        const heldNow = yawBeyondSinceRef.current ? Math.round(now - yawBeyondSinceRef.current) : 0;
+        log(`yawSm=${yawSm.toFixed(3)} beyond=${beyond} holdMs=${heldNow} turnDetected=${turnDetected}`);
+      }
+
       if (beyond) {
         if (!yawBeyondSinceRef.current) {
           yawBeyondSinceRef.current = now;
         } else {
           const held = now - yawBeyondSinceRef.current;
-          if (!turnDetected && held >= yawHoldMinMs) {
+          if (held >= yawHoldMinMs) {
             const dir = yawSm > 0 ? "right" : "left";
+            // remember last direction for UI
+            if (!turnDetected) setTurnDetected(dir);
+
+            // set flags (both can eventually become true across frames)
+            if (dir === "left") setTurnedLeft(true);
+            if (dir === "right") setTurnedRight(true);
+
+            // for race-proof frame check, compute local next values
+            const nextLeft = dir === "left" ? true : turnedLeft;
+            const nextRight = dir === "right" ? true : turnedRight;
+
             log(`Head turn: ${dir} (|yaw|≈${Math.abs(yawSm).toFixed(2)}, held ~${Math.round(held)}ms)`);
-            setTurnDetected(dir);
+
+            // frame-local pass check (both directions achieved)
+            if (!livenessPassed && nextLeft && nextRight && nextBlinkCount >= 2) {
+              log("Frame check → pass (both turns + 2 blinks)");
+              setLivenessPassed(true);
+            }
           }
+
         }
       } else {
         yawBeyondSinceRef.current = null;
       }
 
-      // Draw tiny landmark overlay
+      // overlay + metrics
       drawOverlay(ctx, lm);
-
       if (frameCountRef.current % 30 === 0) {
         log(`EAR(L/R): ${lSm.toFixed(3)}/${rSm.toFixed(3)}  yaw: ${yawSm.toFixed(3)}`);
       }
       updateDebug(lSm, rSm, yawSm);
-      checkComplete();
-      checkWindow();
+
+      // ---------- frame-local decisive check (race-proof) ----------
+      if (!livenessPassed && nextBlinkCount >= 2 && !!nextTurnDetected) {
+        log("Frame check → livenessPassed = true");
+        setLivenessPassed(true);
+      }
     } catch (e) {
       err("onResults error:", e?.name || e, e?.message || "");
     }
-    // include changing values we use in checks
-  }, [turnDetected, blinkCount, livenessPassed, earThreshold, earCloseMinMs, yawAbsThreshold, yawHoldMinMs]);
+    // include changing deps referenced in the function
+  }, [blinkCount, turnDetected, livenessPassed, earThreshold, earCloseMinMs, yawAbsThreshold, yawHoldMinMs]);
 
   function drawOverlay(ctx, lm) {
     const pts = [1, 33, 133, 159, 145, 263, 362, 386, 374, 234, 454];
@@ -332,17 +394,18 @@ export default function LivenessChecker({
     setYawDev(Number(yaw.toFixed(3)));
   }
 
+  // ✅ Correct, simple, state-based check (kept for readability)
   function checkComplete() {
-    const ok = blinkCount >= 2 && !!turnDetected == "left";
+    const ok = turnedLeft && turnedRight;
     if (ok && !livenessPassed) {
-      log("Liveness PASSED (blink + turn)");
+      log("checkComplete → livenessPassed = true");
       setLivenessPassed(true);
     }
   }
 
   function checkWindow() {
     if (!startedAtRef.current) return;
-    // we can auto-fail after sessionWindowMs if you want; currently informational only
+    // informational only; you can auto-fail after sessionWindowMs if needed
   }
 
   // Buttons
@@ -412,8 +475,9 @@ export default function LivenessChecker({
             <div style={kvLabel}>blinkCount</div>
             <div style={kvValue}>{blinkCount}</div>
 
-            <div style={kvLabel}>turnDetected</div>
-            <div style={kvValue}>{turnDetected ?? "—"}</div>
+            <div style={kvLabel}>turnedLeft / turnedRight</div>
+            <div style={kvValue}>{String(turnedLeft)} / {String(turnedRight)}</div>
+
 
             <div style={kvLabel}>leftEAR / rightEAR</div>
             <div style={kvValue}>{leftEAR} / {rightEAR}</div>
