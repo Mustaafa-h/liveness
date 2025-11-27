@@ -2,7 +2,6 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { earFromLandmarks, yawProxy, ema } from "../lib/geometry";
-
 /**
  * LivenessChecker.jsx (UMD build loader + DEBUG + race-proof pass)
  * - Loads MediaPipe FaceMesh & Camera Utils via UMD <script> tags.
